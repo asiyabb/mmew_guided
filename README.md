@@ -131,10 +131,3 @@ As shown in the baseline confusion matrix, the macro baseline misclassified $10\
 3. **Training Stability & Convergence:**
 The training accuracy curve demonstrates that the micro-guided model achieves higher peak accuracy ($91.11\%$ at epoch 29) while maintaining stable loss convergence throughout training.
 
----
-
-## 5. Next Steps for Publication/Thesis
-
-1. **Leave-One-Subject-Out (LOSO) Cross-Validation:** Transition from standard train/test evaluation to full LOSO cross-validation across all 30 subjects to guarantee subject-independent generalization.
-2. **Ablation Studies:** Perform ablation tests on window size ($W \in \{2, 4, 8\}$) and loss weights ($\alpha, \beta$) to determine optimal hyperparameters.
-3. **Feature Visualization:** Implement Grad-CAM/t-SNE visual projections of the latent micro-clues to visualize which facial muscle regions (Action Units) trigger micro-expression features during macro transitions.
