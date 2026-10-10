@@ -55,3 +55,17 @@ Experiments were conducted on the MMEW dataset comparing a **Macro-Only Baseline
 │   └── micro_losses.py         # Triplet and Temporal Consistency loss functions
 ├── visualize_results.py        # End-to-end training, validation & plot generation
 └── evaluate.py                 # Evaluation script for saved model weights
+
+🚀 Getting Started
+1. Train and Visualize Comparison
+Run the complete training pipeline for both baseline and guided models and generate visual comparison plots:
+
+Bash
+python visualize_results.py
+This will save experiment_comparison.png containing loss/accuracy convergence curves, per-class F1 comparisons, confusion matrices, and a performance summary.
+
+2. Evaluate Saved Models
+Evaluate pre-trained model checkpoints (baseline.pth, guided_model.pth, micro_encoder.pth):
+
+Bash
+python evaluate.py
