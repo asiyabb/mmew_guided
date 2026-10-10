@@ -3,14 +3,18 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
+
 from config.config import Config
-from data.dataset import MMEWSequenceDataset, get_subject_splits
+from data.dataset import MMEWSequenceDataset
 from models.vit_extractor import ViTFeatureExtractor
 from models.micro_encoder import MotionMicroEncoder
 from models.macro_guided_model import MacroGuidedModel, MacroBaselineModel
+from visualize_results import create_subject_splits
+
 
 def run_evaluation(model, micro_encoder, vit, loader, mode_name="Model"):
     model.eval()
+    vit.eval()
     if micro_encoder:
         micro_encoder.eval()
 
@@ -35,7 +39,7 @@ def run_evaluation(model, micro_encoder, vit, loader, mode_name="Model"):
     acc = np.mean(np.array(all_preds) == np.array(all_targets))
     f1 = f1_score(all_targets, all_preds, average='macro')
 
-    print(f"\n================ {mode_name} Evaluation ================")
+    print(f"\n================ {mode_name} EVALUATION ================")
     print(f"Accuracy : {acc * 100:.2f}%")
     print(f"Macro F1 : {f1:.4f}\n")
     print("Classification Report:")
@@ -44,25 +48,37 @@ def run_evaluation(model, micro_encoder, vit, loader, mode_name="Model"):
     print(confusion_matrix(all_targets, all_preds))
     return acc, f1
 
+
 if __name__ == "__main__":
     full_dataset = MMEWSequenceDataset(mode="macro")
-    _, val_dataset = get_subject_splits(full_dataset)
+    
+    # Recreate exact subject-grouped validation split used in visualize_results.py (seed=42, test_size=0.2)
+    _, val_dataset = create_subject_splits(full_dataset, test_size=0.2, seed=42)
     val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
 
-    vit = ViTFeatureExtractor().to(Config.DEVICE)
+    vit = ViTFeatureExtractor(freeze=True, unfreeze_last_block=True).to(Config.DEVICE)
 
-    # Evaluate Baseline
-    print("Evaluating Baseline Model...")
+    # 1. Evaluate Baseline Model Checkpoint
+    print("Evaluating Baseline Model on Unseen Validation Subjects...")
     baseline_model = MacroBaselineModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
-    if os.path.exists("baseline.pth"):
-        baseline_model.load_state_dict(torch.load("baseline.pth"))
-    run_evaluation(baseline_model, None, vit, val_loader, mode_name="Macro Baseline")
+    baseline_checkpoint = "baseline_best.pth"
+    
+    if os.path.exists(baseline_checkpoint):
+        baseline_model.load_state_dict(torch.load(baseline_checkpoint))
+        run_evaluation(baseline_model, None, vit, val_loader, mode_name="Macro Baseline")
+    else:
+        print(f"[Error] Could not find checkpoint file: {baseline_checkpoint}")
 
-    # Evaluate Guided Model
-    print("Evaluating Guided Model...")
+    # 2. Evaluate Guided Model Checkpoint
+    print("\nEvaluating Guided Model on Unseen Validation Subjects...")
     guided_model = MacroGuidedModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
     micro_encoder = MotionMicroEncoder().to(Config.DEVICE)
-    if os.path.exists("guided_model.pth") and os.path.exists("micro_encoder.pth"):
-        guided_model.load_state_dict(torch.load("guided_model.pth"))
-        micro_encoder.load_state_dict(torch.load("micro_encoder.pth"))
-    run_evaluation(guided_model, micro_encoder, vit, val_loader, mode_name="Micro-Guided Macro")
+    guided_checkpoint = "guided_model_best.pth"
+    micro_checkpoint = "micro_encoder_best.pth"
+
+    if os.path.exists(guided_checkpoint) and os.path.exists(micro_checkpoint):
+        guided_model.load_state_dict(torch.load(guided_checkpoint))
+        micro_encoder.load_state_dict(torch.load(micro_checkpoint))
+        run_evaluation(guided_model, micro_encoder, vit, val_loader, mode_name="Micro-Guided Macro")
+    else:
+        print(f"[Error] Could not find guided checkpoints: {guided_checkpoint} or {micro_checkpoint}")

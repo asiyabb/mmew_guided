@@ -3,37 +3,54 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import confusion_matrix, f1_score, classification_report
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.model_selection import GroupShuffleSplit
 
 from config.config import Config
-from data.dataset import MMEWSequenceDataset, get_subject_splits
+from data.dataset import MMEWSequenceDataset, AugmentedSubset
 from models.vit_extractor import ViTFeatureExtractor
 from models.micro_encoder import MotionMicroEncoder
 from models.macro_guided_model import MacroGuidedModel, MacroBaselineModel
 from losses.micro_losses import MicroTripletLoss, TemporalConsistencyLoss
+
 
 def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
+
+def create_subject_splits(dataset, test_size=0.2, seed=42):
+    """Generates subject-grouped splits directly without relying on external import."""
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    train_idx, val_idx = next(gss.split(dataset.samples, groups=dataset.subjects))
+
+    raw_train = Subset(dataset, train_idx)
+    raw_val = Subset(dataset, val_idx)
+
+    train_dataset = AugmentedSubset(raw_train, transform=MMEWSequenceDataset.get_train_transforms())
+    val_dataset = AugmentedSubset(raw_val, transform=MMEWSequenceDataset.get_val_transforms())
+
+    return train_dataset, val_dataset
+
+
 def train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS):
     set_seed(42)
     full_dataset = MMEWSequenceDataset(mode="macro")
-    train_dataset, val_dataset = get_subject_splits(full_dataset, test_size=0.2)
-    
+    train_dataset, val_dataset = create_subject_splits(full_dataset, test_size=0.2, seed=42)
+
     train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
-    
+
     # Enable last block fine-tuning
     vit = ViTFeatureExtractor(freeze=True, unfreeze_last_block=True).to(Config.DEVICE)
-    
+
     if model_type == "guided":
         macro_model = MacroGuidedModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
         micro_encoder = MotionMicroEncoder().to(Config.DEVICE)
-        
+
         optimizer = torch.optim.Adam([
             {'params': [p for p in vit.parameters() if p.requires_grad], 'lr': 1e-5},
             {'params': micro_encoder.parameters(), 'lr': Config.LR},
@@ -49,7 +66,7 @@ def train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS):
             {'params': macro_model.parameters(), 'lr': Config.LR}
         ])
 
-    # Balanced Class Weights to combat 'Anger' bias
+    # Balanced Class Weights to combat class bias
     train_labels = [train_dataset[i][1].item() for i in range(len(train_dataset))]
     class_weights = compute_class_weight('balanced', classes=np.unique(train_labels), y=train_labels)
     class_weights = torch.tensor(class_weights, dtype=torch.float).to(Config.DEVICE)
@@ -58,9 +75,17 @@ def train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     loss_history, acc_history = [], []
-    val_loss_history, val_acc_history = [], []
+    best_val_acc = -1.0
 
-    print(f"\n--- Running Protocol: {model_type.upper()} ---")
+    # Define paths for saving best model weights
+    if model_type == "guided":
+        best_macro_path = "guided_model_best.pth"
+        best_micro_path = "micro_encoder_best.pth"
+    else:
+        best_macro_path = "baseline_best.pth"
+        best_micro_path = None
+
+    print(f"\n--- Running Training Protocol: {model_type.upper()} ---")
 
     for epoch in range(epochs):
         macro_model.train()
@@ -97,11 +122,9 @@ def train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS):
 
         scheduler.step()
         epoch_loss = running_loss / total_samples
-        epoch_acc = correct_preds / total_samples
         loss_history.append(epoch_loss)
-        acc_history.append(epoch_acc)
 
-        # Validation loop
+        # Validation Loop
         macro_model.eval()
         vit.eval()
         if micro_encoder:
@@ -123,17 +146,29 @@ def train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS):
                 val_correct += (preds == y).sum().item()
                 val_total += x.size(0)
 
-        val_acc_history.append(val_correct / val_total)
-        print(f"Epoch [{epoch+1:02d}/{epochs:02d}] - Train Loss: {epoch_loss:.4f} - Val Acc: {val_acc_history[-1]*100:.2f}%")
+        current_val_acc = val_correct / val_total
+        acc_history.append(current_val_acc)
 
-    # Save model state dicts
-    if model_type == "guided":
-        torch.save(macro_model.state_dict(), "guided_model.pth")
-        torch.save(micro_encoder.state_dict(), "micro_encoder.pth")
-    else:
-        torch.save(macro_model.state_dict(), "baseline.pth")
+        # Save Best Model Checkpoint
+        if current_val_acc > best_val_acc:
+            best_val_acc = current_val_acc
+            torch.save(macro_model.state_dict(), best_macro_path)
+            if micro_encoder and best_micro_path:
+                torch.save(micro_encoder.state_dict(), best_micro_path)
 
-    # Final Metrics
+        print(f"Epoch [{epoch+1:02d}/{epochs:02d}] - Train Loss: {epoch_loss:.4f} - Val Acc: {current_val_acc*100:.2f}% (Best: {best_val_acc*100:.2f}%)")
+
+    # Load Best Model Weights for Final Evaluation & Visualizations
+    print(f"\nLoading best checkpoint for [{model_type.upper()}] evaluation (Val Acc: {best_val_acc*100:.2f}%)...")
+    macro_model.load_state_dict(torch.load(best_macro_path))
+    if model_type == "guided" and best_micro_path:
+        micro_encoder.load_state_dict(torch.load(best_micro_path))
+
+    macro_model.eval()
+    vit.eval()
+    if micro_encoder:
+        micro_encoder.eval()
+
     all_preds, all_targets = [], []
     with torch.no_grad():
         for x, y in val_loader:
@@ -146,15 +181,17 @@ def train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS):
 
     cm = confusion_matrix(all_targets, all_preds, normalize='true')
     report = classification_report(all_targets, all_preds, target_names=Config.EMOTIONS, output_dict=True, zero_division=0)
+    overall_f1 = f1_score(all_targets, all_preds, average='macro')
 
     return {
         "loss": loss_history,
-        "acc": val_acc_history,
+        "acc": acc_history,
         "cm": cm,
         "report": report,
-        "overall_acc": val_acc_history[-1],
-        "overall_f1": f1_score(all_targets, all_preds, average='macro')
+        "overall_acc": best_val_acc,
+        "overall_f1": overall_f1
     }
+
 
 def generate_comparative_plots(baseline_res, guided_res, save_path="experiment_comparison.png"):
     plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
@@ -184,12 +221,12 @@ def generate_comparative_plots(baseline_res, guided_res, save_path="experiment_c
     emotions = Config.EMOTIONS
     b_f1s = [baseline_res["report"][e]["f1-score"] for e in emotions]
     g_f1s = [guided_res["report"][e]["f1-score"] for e in emotions]
-    
+
     x = np.arange(len(emotions))
     width = 0.35
     ax3.bar(x - width/2, b_f1s, width, label='Baseline', color='#72b7b2')
     ax3.bar(x + width/2, g_f1s, width, label='Micro-Guided', color='#e15759')
-    ax3.set_title("Per-Class F1-Score Comparison", fontsize=13, fontweight='bold')
+    ax3.set_title("Validation Per-Class F1-Score (Best Weights)", fontsize=13, fontweight='bold')
     ax3.set_xticks(x)
     ax3.set_xticklabels(emotions, rotation=30, ha='right')
     ax3.set_ylabel("F1-Score", fontsize=11)
@@ -200,7 +237,7 @@ def generate_comparative_plots(baseline_res, guided_res, save_path="experiment_c
     ax4 = fig.add_subplot(2, 3, 4)
     sns.heatmap(baseline_res["cm"], annot=True, fmt=".2f", cmap="Blues", cbar=False,
                 xticklabels=emotions, yticklabels=emotions, ax=ax4)
-    ax4.set_title("Baseline: Normalized Confusion Matrix", fontsize=12, fontweight='bold')
+    ax4.set_title("Baseline: Val Confusion Matrix (Best)", fontsize=12, fontweight='bold')
     ax4.set_xlabel("Predicted Label", fontsize=10)
     ax4.set_ylabel("True Label", fontsize=10)
 
@@ -208,26 +245,29 @@ def generate_comparative_plots(baseline_res, guided_res, save_path="experiment_c
     ax5 = fig.add_subplot(2, 3, 5)
     sns.heatmap(guided_res["cm"], annot=True, fmt=".2f", cmap="Reds", cbar=False,
                 xticklabels=emotions, yticklabels=emotions, ax=ax5)
-    ax5.set_title("Micro-Guided: Normalized Confusion Matrix", fontsize=12, fontweight='bold')
+    ax5.set_title("Micro-Guided: Val Confusion Matrix (Best)", fontsize=12, fontweight='bold')
     ax5.set_xlabel("Predicted Label", fontsize=10)
     ax5.set_ylabel("True Label", fontsize=10)
 
     # 6. Performance Summary Card
     ax6 = fig.add_subplot(2, 3, 6)
     ax6.axis('off')
+    acc_diff = (guided_res['overall_acc'] - baseline_res['overall_acc']) * 100
+    f1_diff = guided_res['overall_f1'] - baseline_res['overall_f1']
+
     summary_text = (
         "====================================\n"
-        "       EXPERIMENTAL RESULTS         \n"
+        "     VALIDATION RESULTS SUMMARY     \n"
         "====================================\n\n"
-        f"Baseline Model:\n"
+        f"Baseline Model (Best Weights):\n"
         f"  • Overall Accuracy : {baseline_res['overall_acc']*100:.2f}%\n"
         f"  • Macro F1-Score   : {baseline_res['overall_f1']:.4f}\n\n"
-        f"Micro-Guided Model:\n"
+        f"Micro-Guided Model (Best Weights):\n"
         f"  • Overall Accuracy : {guided_res['overall_acc']*100:.2f}%\n"
         f"  • Macro F1-Score   : {guided_res['overall_f1']:.4f}\n\n"
         "------------------------------------\n"
-        f"Accuracy Gain : +{(guided_res['overall_acc'] - baseline_res['overall_acc'])*100:.2f}%\n"
-        f"F1-Score Gain : +{(guided_res['overall_f1'] - baseline_res['overall_f1']):.4f}\n"
+        f"Accuracy Gain : {'+' if acc_diff >= 0 else ''}{acc_diff:.2f}%\n"
+        f"F1-Score Gain : {'+' if f1_diff >= 0 else ''}{f1_diff:.4f}\n"
         "===================================="
     )
     ax6.text(0.1, 0.2, summary_text, fontsize=12, family='monospace',
@@ -236,6 +276,7 @@ def generate_comparative_plots(baseline_res, guided_res, save_path="experiment_c
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"\n[Success] Visual comparison plot saved successfully to: {save_path}")
+
 
 if __name__ == "__main__":
     baseline_results = train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS)

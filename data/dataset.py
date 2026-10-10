@@ -109,15 +109,33 @@ class AugmentedSubset(Dataset):
         return len(self.subset)
 
 
-def get_subject_splits(dataset, test_size=0.2, seed=42):
-    """Generates subject-grouped splits and routes train/val transforms."""
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    train_idx, val_idx = next(gss.split(dataset.samples, groups=dataset.subjects))
+def get_three_way_subject_splits(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """
+    Splits subjects strictly into Train, Validation, and Test sets with ZERO data leakage.
+    """
+    assert abs((train_ratio + val_ratio + test_ratio) - 1.0) < 1e-5, "Ratios must sum to 1.0"
     
+    # Split 1: Separate Test set from Train+Val
+    gss_test = GroupShuffleSplit(n_splits=1, test_size=test_ratio, random_state=seed)
+    train_val_idx, test_idx = next(gss_test.split(dataset.samples, groups=dataset.subjects))
+    
+    train_val_subjects = [dataset.subjects[i] for i in train_val_idx]
+    train_val_samples = [dataset.samples[i] for i in train_val_idx]
+    
+    # Split 2: Separate Train and Validation
+    relative_val_ratio = val_ratio / (train_ratio + val_ratio)
+    gss_val = GroupShuffleSplit(n_splits=1, test_size=relative_val_ratio, random_state=seed)
+    rel_train_idx, rel_val_idx = next(gss_val.split(train_val_samples, groups=train_val_subjects))
+    
+    train_idx = [train_val_idx[i] for i in rel_train_idx]
+    val_idx = [train_val_idx[i] for i in rel_val_idx]
+
     raw_train = Subset(dataset, train_idx)
     raw_val = Subset(dataset, val_idx)
+    raw_test = Subset(dataset, test_idx)
 
     train_dataset = AugmentedSubset(raw_train, transform=MMEWSequenceDataset.get_train_transforms())
     val_dataset = AugmentedSubset(raw_val, transform=MMEWSequenceDataset.get_val_transforms())
+    test_dataset = AugmentedSubset(raw_test, transform=MMEWSequenceDataset.get_val_transforms())
 
-    return train_dataset, val_dataset
+    return train_dataset, val_dataset, test_dataset
