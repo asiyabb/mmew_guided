@@ -1,18 +1,18 @@
 import os
 import torch
-import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.utils.data import DataLoader
 from sklearn.metrics import confusion_matrix, f1_score, classification_report
+from sklearn.utils.class_weight import compute_class_weight
 
 from config.config import Config
-from data.dataset import MMEWSequenceDataset
+from data.dataset import MMEWSequenceDataset, get_subject_splits
 from models.vit_extractor import ViTFeatureExtractor
 from models.micro_encoder import MotionMicroEncoder
-from models.macro_guided_model import MacroGuidedModel
-from losses.micro_losses import ContrastiveLoss, TemporalConsistencyLoss
+from models.macro_guided_model import MacroGuidedModel, MacroBaselineModel
+from losses.micro_losses import MicroTripletLoss, TemporalConsistencyLoss
 
 def set_seed(seed=42):
     torch.manual_seed(seed)
@@ -21,57 +21,70 @@ def set_seed(seed=42):
 
 def train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS):
     set_seed(42)
-    dataset = MMEWSequenceDataset(mode="macro")
-    loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
+    full_dataset = MMEWSequenceDataset(mode="macro")
+    train_dataset, val_dataset = get_subject_splits(full_dataset, test_size=0.2)
     
-    vit = ViTFeatureExtractor().to(Config.DEVICE)
-    macro_model = MacroGuidedModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
+    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
     
-    micro_encoder = None
+    # Enable last block fine-tuning
+    vit = ViTFeatureExtractor(freeze=True, unfreeze_last_block=True).to(Config.DEVICE)
+    
     if model_type == "guided":
+        macro_model = MacroGuidedModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
         micro_encoder = MotionMicroEncoder().to(Config.DEVICE)
-        optimizer = torch.optim.Adam(
-            list(micro_encoder.parameters()) + list(macro_model.parameters()), 
-            lr=Config.LR
-        )
-        contrastive_criterion = ContrastiveLoss()
+        
+        optimizer = torch.optim.Adam([
+            {'params': [p for p in vit.parameters() if p.requires_grad], 'lr': 1e-5},
+            {'params': micro_encoder.parameters(), 'lr': Config.LR},
+            {'params': macro_model.parameters(), 'lr': Config.LR}
+        ])
+        triplet_criterion = MicroTripletLoss()
         temporal_criterion = TemporalConsistencyLoss()
     else:
-        optimizer = torch.optim.Adam(macro_model.parameters(), lr=Config.LR)
+        macro_model = MacroBaselineModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
+        micro_encoder = None
+        optimizer = torch.optim.Adam([
+            {'params': [p for p in vit.parameters() if p.requires_grad], 'lr': 1e-5},
+            {'params': macro_model.parameters(), 'lr': Config.LR}
+        ])
 
-    cls_criterion = nn.CrossEntropyLoss()
+    # Balanced Class Weights to combat 'Anger' bias
+    train_labels = [train_dataset[i][1].item() for i in range(len(train_dataset))]
+    class_weights = compute_class_weight('balanced', classes=np.unique(train_labels), y=train_labels)
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(Config.DEVICE)
+    cls_criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
 
-    loss_history = []
-    acc_history = []
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    print(f"\n--- Running Training Protocol: {model_type.upper()} ---")
+    loss_history, acc_history = [], []
+    val_loss_history, val_acc_history = [], []
+
+    print(f"\n--- Running Protocol: {model_type.upper()} ---")
 
     for epoch in range(epochs):
         macro_model.train()
+        vit.train()
         if micro_encoder:
             micro_encoder.train()
 
-        running_loss = 0.0
-        correct_preds = 0
-        total_samples = 0
+        running_loss, correct_preds, total_samples = 0.0, 0, 0
 
-        for x, y in loader:
+        for x, y in train_loader:
             x, y = x.to(Config.DEVICE), y.to(Config.DEVICE)
             optimizer.zero_grad()
 
-            with torch.no_grad():
-                vit_feats = vit(x)
+            vit_feats = vit(x)
 
             if model_type == "guided":
                 latent_clues = micro_encoder(vit_feats)
-                loss_c = contrastive_criterion(latent_clues)
-                loss_t = temporal_criterion(latent_clues)
+                loss_trip = triplet_criterion(latent_clues)
+                loss_temp = temporal_criterion(latent_clues)
                 logits = macro_model(vit_feats, latent_clues)
                 loss_cls = cls_criterion(logits, y)
-                loss = loss_cls + (Config.ALPHA_CONTRASTIVE * loss_c) + (Config.BETA_TEMPORAL * loss_t)
+                loss = loss_cls + (Config.ALPHA_TRIPLET * loss_trip) + (Config.BETA_TEMPORAL * loss_temp)
             else:
-                dummy_clues = torch.zeros(x.size(0), 7, 256, device=Config.DEVICE)
-                logits = macro_model(vit_feats, dummy_clues)
+                logits = macro_model(vit_feats)
                 loss = cls_criterion(logits, y)
 
             loss.backward()
@@ -82,44 +95,64 @@ def train_and_collect_history(model_type="baseline", epochs=Config.EPOCHS):
             correct_preds += (preds == y).sum().item()
             total_samples += x.size(0)
 
+        scheduler.step()
         epoch_loss = running_loss / total_samples
         epoch_acc = correct_preds / total_samples
         loss_history.append(epoch_loss)
         acc_history.append(epoch_acc)
 
-        print(f"Epoch [{epoch+1:02d}/{epochs:02d}] - Loss: {epoch_loss:.4f} - Acc: {epoch_acc*100:.2f}%")
+        # Validation loop
+        macro_model.eval()
+        vit.eval()
+        if micro_encoder:
+            micro_encoder.eval()
 
-    # Final Evaluation for Confusion Matrix & Class Metrics
-    macro_model.eval()
-    if micro_encoder:
-        micro_encoder.eval()
+        val_loss, val_correct, val_total = 0.0, 0, 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(Config.DEVICE), y.to(Config.DEVICE)
+                vit_feats = vit(x)
+                if model_type == "guided":
+                    latent_clues = micro_encoder(vit_feats)
+                    logits = macro_model(vit_feats, latent_clues)
+                else:
+                    logits = macro_model(vit_feats)
 
+                val_loss += cls_criterion(logits, y).item() * x.size(0)
+                preds = torch.argmax(logits, dim=1)
+                val_correct += (preds == y).sum().item()
+                val_total += x.size(0)
+
+        val_acc_history.append(val_correct / val_total)
+        print(f"Epoch [{epoch+1:02d}/{epochs:02d}] - Train Loss: {epoch_loss:.4f} - Val Acc: {val_acc_history[-1]*100:.2f}%")
+
+    # Save model state dicts
+    if model_type == "guided":
+        torch.save(macro_model.state_dict(), "guided_model.pth")
+        torch.save(micro_encoder.state_dict(), "micro_encoder.pth")
+    else:
+        torch.save(macro_model.state_dict(), "baseline.pth")
+
+    # Final Metrics
     all_preds, all_targets = [], []
-    eval_loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
-    
     with torch.no_grad():
-        for x, y in eval_loader:
+        for x, y in val_loader:
             x, y = x.to(Config.DEVICE), y.to(Config.DEVICE)
             vit_feats = vit(x)
-            if model_type == "guided":
-                latent_clues = micro_encoder(vit_feats)
-            else:
-                latent_clues = torch.zeros(x.size(0), 7, 256, device=Config.DEVICE)
-            
-            logits = macro_model(vit_feats, latent_clues)
+            logits = macro_model(vit_feats, micro_encoder(vit_feats)) if model_type == "guided" else macro_model(vit_feats)
             preds = torch.argmax(logits, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(y.cpu().numpy())
 
     cm = confusion_matrix(all_targets, all_preds, normalize='true')
-    report = classification_report(all_targets, all_preds, target_names=Config.EMOTIONS, output_dict=True)
+    report = classification_report(all_targets, all_preds, target_names=Config.EMOTIONS, output_dict=True, zero_division=0)
 
     return {
         "loss": loss_history,
-        "acc": acc_history,
+        "acc": val_acc_history,
         "cm": cm,
         "report": report,
-        "overall_acc": epoch_acc,
+        "overall_acc": val_acc_history[-1],
         "overall_f1": f1_score(all_targets, all_preds, average='macro')
     }
 
@@ -127,17 +160,17 @@ def generate_comparative_plots(baseline_res, guided_res, save_path="experiment_c
     plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
     fig = plt.figure(figsize=(18, 12))
 
-    # 1. Accuracy Curve
+    # 1. Validation Accuracy Curve
     ax1 = fig.add_subplot(2, 3, 1)
-    ax1.plot(baseline_res["acc"], label="Baseline (Macro Only)", color="#1f77b4", linewidth=2.5, linestyle="--")
+    ax1.plot(baseline_res["acc"], label="Baseline (Macro)", color="#1f77b4", linewidth=2.5, linestyle="--")
     ax1.plot(guided_res["acc"], label="Micro-Guided Macro", color="#d62728", linewidth=2.5)
-    ax1.set_title("Training Accuracy Convergence", fontsize=13, fontweight='bold')
+    ax1.set_title("Validation Accuracy Convergence", fontsize=13, fontweight='bold')
     ax1.set_xlabel("Epochs", fontsize=11)
     ax1.set_ylabel("Accuracy", fontsize=11)
     ax1.legend(loc="lower right", frameon=True)
     ax1.set_ylim(0, 1.05)
 
-    # 2. Loss Curve
+    # 2. Training Loss Curve
     ax2 = fig.add_subplot(2, 3, 2)
     ax2.plot(baseline_res["loss"], label="Baseline Loss", color="#1f77b4", linewidth=2.5, linestyle="--")
     ax2.plot(guided_res["loss"], label="Micro-Guided Loss", color="#d62728", linewidth=2.5)
@@ -179,7 +212,7 @@ def generate_comparative_plots(baseline_res, guided_res, save_path="experiment_c
     ax5.set_xlabel("Predicted Label", fontsize=10)
     ax5.set_ylabel("True Label", fontsize=10)
 
-    # 6. Overall Performance Metrics Summary Card
+    # 6. Performance Summary Card
     ax6 = fig.add_subplot(2, 3, 6)
     ax6.axis('off')
     summary_text = (

@@ -1,12 +1,13 @@
+import os
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from config.config import Config
-from data.dataset import MMEWSequenceDataset
+from data.dataset import MMEWSequenceDataset, get_subject_splits
 from models.vit_extractor import ViTFeatureExtractor
 from models.micro_encoder import MotionMicroEncoder
-from models.macro_guided_model import MacroGuidedModel
+from models.macro_guided_model import MacroGuidedModel, MacroBaselineModel
 
 def run_evaluation(model, micro_encoder, vit, loader, mode_name="Model"):
     model.eval()
@@ -21,14 +22,13 @@ def run_evaluation(model, micro_encoder, vit, loader, mode_name="Model"):
             x, y = x.to(Config.DEVICE), y.to(Config.DEVICE)
             vit_feats = vit(x)
 
-            if micro_encoder:
+            if micro_encoder and isinstance(model, MacroGuidedModel):
                 latent_clues = micro_encoder(vit_feats)
+                logits = model(vit_feats, latent_clues)
             else:
-                latent_clues = torch.zeros(x.size(0), 7, 256, device=Config.DEVICE)
+                logits = model(vit_feats)
 
-            logits = model(vit_feats, latent_clues)
             preds = torch.argmax(logits, dim=1)
-
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(y.cpu().numpy())
 
@@ -45,20 +45,24 @@ def run_evaluation(model, micro_encoder, vit, loader, mode_name="Model"):
     return acc, f1
 
 if __name__ == "__main__":
-    dataset = MMEWSequenceDataset(mode="macro")
-    loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+    full_dataset = MMEWSequenceDataset(mode="macro")
+    _, val_dataset = get_subject_splits(full_dataset)
+    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
 
     vit = ViTFeatureExtractor().to(Config.DEVICE)
 
     # Evaluate Baseline
-    print("Loading Baseline model structure...")
-    baseline_model = MacroGuidedModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
-    # If saved checkpoint exists, uncomment: baseline_model.load_state_dict(torch.load("baseline.pth"))
-    run_evaluation(baseline_model, None, vit, loader, mode_name="Macro Baseline")
+    print("Evaluating Baseline Model...")
+    baseline_model = MacroBaselineModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
+    if os.path.exists("baseline.pth"):
+        baseline_model.load_state_dict(torch.load("baseline.pth"))
+    run_evaluation(baseline_model, None, vit, val_loader, mode_name="Macro Baseline")
 
     # Evaluate Guided Model
-    print("Loading Guided model structure...")
+    print("Evaluating Guided Model...")
     guided_model = MacroGuidedModel(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
     micro_encoder = MotionMicroEncoder().to(Config.DEVICE)
-    # If saved checkpoint exists, load weights here
-    run_evaluation(guided_model, micro_encoder, vit, loader, mode_name="Micro-Guided Macro")
+    if os.path.exists("guided_model.pth") and os.path.exists("micro_encoder.pth"):
+        guided_model.load_state_dict(torch.load("guided_model.pth"))
+        micro_encoder.load_state_dict(torch.load("micro_encoder.pth"))
+    run_evaluation(guided_model, micro_encoder, vit, val_loader, mode_name="Micro-Guided Macro")
