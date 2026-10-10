@@ -1,71 +1,35 @@
-# Micro-Guided Macro-Expression Recognition
+# Micro-Guided Macro-Expression Recognition Framework
 
-This repository implements a hybrid deep learning architecture that enhances global macro-expression recognition by capturing fine-grained, short-term facial motion dynamics ("micro-clues") without requiring explicit micro-expression frame annotations.
-
----
-
-## 📌 Architecture Overview
-
-The pipeline leverages a dual-stream architecture built upon Vision Transformer (ViT) feature extraction:
-
-1. **Feature Extraction:** Video frames are passed through a fine-tuned Vision Transformer (`ViT-B/16`) to extract spatial feature embeddings per frame.
-2. **Micro Motion Encoding:** Short, overlapping sliding windows extract local temporal representations using 1D temporal convolutions, yielding **latent micro-clues**.
-3. **Auxiliary Regularization:**
-   - **Triplet Loss:** Encourages distinct clustering of local micro-motion embeddings.
-   - **Temporal Consistency Loss:** Enforces smooth transitions between consecutive temporal windows.
-4. **Macro Sequence Modeling:** Full video sequence representations are captured using a Bidirectional GRU.
-5. **Cross-Attention & Adaptive Gating:** Macro representations query the latent micro-clues using Multi-Head Cross-Attention. A dynamic Sigmoid gating mechanism regulates the flow of micro-guidance into the final classification head.
+A generalized deep learning framework for macro-expression recognition guided by micro-expression temporal clues on the MMEW and CASME II datasets.
 
 ---
 
-## 📊 Experimental Results
+## 📌 Project Architecture
 
-Experiments were conducted on the MMEW dataset comparing a **Macro-Only Baseline Model** against the **Micro-Guided Macro Model**.
-
-### **Performance Comparison Summary**
-
-| Metric | Baseline (Macro) | Micro-Guided Macro | Absolute Improvement |
-| :--- | :---: | :---: | :---: |
-| **Overall Accuracy** | **33.33%** | **41.67%** | **+8.33%** |
-| **Macro F1-Score** | **0.3139** | **0.4016** | **+0.0877** |
+* **Spatial Feature Extractor:** ViT-B/16 (ImageNet pre-trained) with top-block Transformer fine-tuning.
+* **Temporal Micro-Encoder:** Sliding window temporal encoder guided by Triplet & Temporal Consistency losses.
+* **Micro-Guided Macro Model:** Bidirectional GRU macro sequence processor augmented with dynamic Cross-Attention and Gated Fusion.
+* **Subject-Independent Splitting:** 3-way Grouped Split (Train / Val / Test) preventing subject data leakage.
 
 ---
 
-### **Key Findings**
-* **Faster & Stable Convergence:** The Micro-Guided model demonstrates significantly lower training loss and smoother validation accuracy convergence compared to the baseline.
-* **Per-Class Improvements:**
-  * **Happiness:** F1-score increased from `0.67` to `0.80`.
-  * **Surprise:** F1-score increased from `0.29` to `0.62`.
-* **Reduced Prediction Bias:** The inclusion of dynamic micro-guidance helped mitigate over-prediction bias toward dominant classes present in the baseline model.
-
----
-
-## 🛠️ Project Structure
+## 📁 Repository Structure
 
 ```text
+mmew_guided_recognition/
 ├── config/
-│   └── config.py               # Hyperparameters and path configurations
+│   └── config.py               # Global hyperparameters and dataset configurations
 ├── data/
-│   └── dataset.py              # MMEW Dataset loader & Subject-Grouped splitting
-├── models/
-│   ├── vit_extractor.py        # ViT-B/16 spatial feature extractor
-│   ├── micro_encoder.py        # 1D-CNN temporal micro-motion encoder
-│   └── macro_guided_model.py   # GRU baseline & Cross-Attention Guided models
+│   └── dataset.py              # Sequence dataset loader & subject-grouping splitters
 ├── losses/
-│   └── micro_losses.py         # Triplet and Temporal Consistency loss functions
-├── visualize_results.py        # End-to-end training, validation & plot generation
-└── evaluate.py                 # Evaluation script for saved model weights
-
-🚀 Getting Started
-1. Train and Visualize Comparison
-Run the complete training pipeline for both baseline and guided models and generate visual comparison plots:
-
-Bash
-python visualize_results.py
-This will save experiment_comparison.png containing loss/accuracy convergence curves, per-class F1 comparisons, confusion matrices, and a performance summary.
-
-2. Evaluate Saved Models
-Evaluate pre-trained model checkpoints (baseline.pth, guided_model.pth, micro_encoder.pth):
-
-Bash
-python evaluate.py
+│   └── micro_losses.py         # Micro-Triplet & Temporal Consistency loss functions
+├── models/
+│   ├── vit_extractor.py        # ViT Feature Extractor
+│   ├── micro_encoder.py        # Temporal Motion Micro-Encoder
+│   └── macro_guided_model.py   # Baseline GRU and Cross-Attention Micro-Guided models
+├── baseline_best.pth           # Saved best checkpoint for Macro Baseline
+├── guided_model_best.pth       # Saved best checkpoint for Micro-Guided Model
+├── micro_encoder_best.pth     # Saved best checkpoint for Micro-Encoder
+├── visualize_results.py        # Training, checkpointing, and visualization script
+├── evaluate.py                 # Standalone Test-Set evaluation script
+└── experiment_comparison.png   # Generated training & validation comparison charts
