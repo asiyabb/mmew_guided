@@ -1,6 +1,6 @@
 # Micro-Guided Macro-Expression Recognition Framework
 
-A generalized deep learning framework for macro-expression recognition guided by micro-expression temporal clues on the MMEW and CASME II datasets.
+A generalized deep learning framework for macro-expression recognition guided by micro-expression temporal clues on the MMEW dataset.
 
 ---
 
